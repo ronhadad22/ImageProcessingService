@@ -1,78 +1,156 @@
-import telebot
-from loguru import logger
 import os
-import time
-from telebot.types import InputFile
-from polybot.img_proc import Img
+import telebot
+import cv2
+from dotenv import load_dotenv
+from img_proc import Img
 
+# load environment variables
+load_dotenv()
 
-class Bot:
+# Check if TELEGRAM_TOKEN is set in the .env file
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+if not TELEGRAM_TOKEN:
+    print("Error: TELEGRAM_TOKEN is not set in the .env file.")
+    exit(1)
 
-    def __init__(self, token, telegram_chat_url):
-        # create a new instance of the TeleBot class.
-        # all communication with Telegram servers are done using self.telegram_bot_client
-        self.telegram_bot_client = telebot.TeleBot(token)
+# initialize telegram-bot
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-        # remove any existing webhooks configured in Telegram servers
-        self.telegram_bot_client.remove_webhook()
-        time.sleep(0.5)
+# Dictionary to store images temporarily
+user_images = {}
 
-        # set the webhook URL
-        self.telegram_bot_client.set_webhook(url=f'{telegram_chat_url}/{token}/', timeout=60)
+# handler for the /start command
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    bot.send_message(message.chat.id,
+                "Hello!\n\nSend me an image and choose a filter:\n"
+                     "- Blur: Reduce noise and detail.\n"
+                     "- Rotate: Turn the image upside down.\n"
+                     "- Salt and Pepper: Add random bright and dark pixels.\n"
+                     "- Segment: Divide the image based on color.\n"
+                     "- Grayscale: Convert to grayscale.\n"
+                     "- Sharpen: Enhance edges and details.\n"
+                     "- Emboss: Create a raised effect.\n"
+                     "- Invert Colors: Invert the image colors.\n"
+                     "- Oil Painting: Apply an oil painting-like effect.\n"
+                     "- Cartoonize: Create a cartoon-like version.\n")
 
-        logger.info(f'Telegram Bot information\n\n{self.telegram_bot_client.get_me()}')
+# handler for receiving photos
+@bot.message_handler(content_types=['photo'])
+def handle_image(message):
+    try:
+        print("Received a photo message")
+        # get the photo file id
+        file_id = message.photo[-1].file_id
+        # get the file object using the file id
+        file_info = bot.get_file(file_id)
+        # download the file
+        downloaded_file = bot.download_file(file_info.file_path)
 
-    def send_text(self, chat_id, text):
-        self.telegram_bot_client.send_message(chat_id, text)
+        # save the file temporarily with a unique name based on the file id
+        image_path = f"images/{file_id}.jpg"
+        with open(image_path, 'wb') as new_file:
+            new_file.write(downloaded_file)
 
-    def send_text_with_quote(self, chat_id, text, quoted_msg_id):
-        self.telegram_bot_client.send_message(chat_id, text, reply_to_message_id=quoted_msg_id)
+        # check if this is the first image or the second image for concatenation
+        if message.chat.id in user_images:
+            print("User already has an image in memory")
+            if 'concat_pending' in user_images[message.chat.id]:
+                print("This is the second image for concatenation")
+                # this is the second image for concatenation
+                second_image_path = image_path
+                first_image_path = user_images[message.chat.id]['concat_pending']
+                del user_images[message.chat.id]['concat_pending']
 
-    def is_current_msg_photo(self, msg):
-        return 'photo' in msg
+                # load the images
+                img_processor = Img(first_image_path)
+                first_image_data = cv2.imread(first_image_path)
+                second_image_data = cv2.imread(second_image_path)
 
-    def download_user_photo(self, msg):
-        """
-        Downloads the photos that sent to the Bot to `photos` directory (should be existed)
-        :return:
-        """
-        if not self.is_current_msg_photo(msg):
-            raise RuntimeError(f'Message content of type \'photo\' expected')
+                # concatenate the images
+                concatenated_image = img_processor.concat(second_image_data)
+                if concatenated_image is not None:
+                    print("Concatenation successful")
+                    # save and send the concatenated image
+                    processed_image_path = img_processor.save_image(concatenated_image, suffix='_concatenated')
+                    with open(processed_image_path, 'rb') as photo_file:
+                        bot.send_photo(message.chat.id, photo_file)
+                else:
+                    print("Error concatenating images.")
+                    bot.reply_to(message, "Error concatenating images.")
 
-        file_info = self.telegram_bot_client.get_file(msg['photo'][-1]['file_id'])
-        data = self.telegram_bot_client.download_file(file_info.file_path)
-        folder_name = file_info.file_path.split('/')[0]
+                # clear user history
+                del user_images[message.chat.id]
+            else:
+                # this is the first image
+                print("This is the first image for concatenation")
+                user_images[message.chat.id]['concat_pending'] = image_path
+                bot.reply_to(message, "First image saved successfully! Now please send the second image to concatenate with.")
+        else:
+            # this is the first image
+            print("This is the first image received")
+            user_images[message.chat.id] = {'concat_pending': image_path}
+            bot.reply_to(message, "First image saved successfully! To apply the concatenation filter, please send another image or choose a filter from the list at the top of the page to apply a filter.")
+    except Exception as e:
+        print(f"Error handling image: {e}")
+        bot.reply_to(message, f"Error handling image: {e}")
 
-        if not os.path.exists(folder_name):
-            os.makedirs(folder_name)
+# handler for filter selection
+@bot.message_handler(
+    func=lambda message: message.text.lower() in ['blur', 'rotate', 'salt and pepper', 'segment', 'grayscale',
+                                                  'sharpen', 'emboss', 'invert colors', 'oil painting', 'cartoonize'])
+def handle_filter(message):
+    try:
+        # Check if the user has previously sent an image
+        if message.chat.id in user_images:
+            # Get the image path
+            if 'concat_pending' in user_images[message.chat.id]:
+                image_path = user_images[message.chat.id]['concat_pending']
+            else:
+                image_path = user_images[message.chat.id]['first_image']
 
-        with open(file_info.file_path, 'wb') as photo:
-            photo.write(data)
+            # apply the selected filter
+            img_processor = Img(image_path)
+            filter_name = message.text.lower()
 
-        return file_info.file_path
+            if filter_name == 'blur':
+                processed_image = img_processor.blur()
+            elif filter_name == 'rotate':
+                processed_image = img_processor.rotate()
+            elif filter_name == 'salt and pepper':
+                processed_image = img_processor.salt_n_pepper()
+            elif filter_name == 'segment':
+                processed_image = img_processor.segment()
+            elif filter_name == 'grayscale':
+                processed_image = img_processor.grayscale()
+            elif filter_name == 'sharpen':
+                processed_image = img_processor.sharpen()
+            elif filter_name == 'emboss':
+                processed_image = img_processor.emboss()
+            elif filter_name == 'invert colors':
+                processed_image = img_processor.invert_colors()
+            elif filter_name == 'oil painting':
+                processed_image = img_processor.oil_painting()
+            elif filter_name == 'cartoonize':
+                processed_image = img_processor.cartoonize()
+            else:
+                processed_image = None
 
-    def send_photo(self, chat_id, img_path):
-        if not os.path.exists(img_path):
-            raise RuntimeError("Image path doesn't exist")
+            # check if the filter was applied successfully
+            if processed_image is not None:
+                # save and send the processed image
+                processed_image_path = img_processor.save_image(processed_image, suffix=f'_{filter_name.replace(" ", "_")}')
+                with open(processed_image_path, 'rb') as photo_file:
+                    bot.send_photo(message.chat.id, photo_file)
+            else:
+                bot.reply_to(message, f"Error applying {filter_name} filter: Result is None.")
 
-        self.telegram_bot_client.send_photo(
-            chat_id,
-            InputFile(img_path)
-        )
+            # remove the image path from the dict
+            del user_images[message.chat.id]
+        else:
+            bot.reply_to(message, "Please send an image first.")
+    except Exception as e:
+        bot.reply_to(message, f"Error processing image: {e}")
 
-    def handle_message(self, msg):
-        """Bot Main message handler"""
-        logger.info(f'Incoming message: {msg}')
-        self.send_text(msg['chat']['id'], f'Your original message: {msg["text"]}')
-
-
-class QuoteBot(Bot):
-    def handle_message(self, msg):
-        logger.info(f'Incoming message: {msg}')
-
-        if msg["text"] != 'Please don\'t quote me':
-            self.send_text_with_quote(msg['chat']['id'], msg["text"], quoted_msg_id=msg["message_id"])
-
-
-class ImageProcessingBot(Bot):
-    pass
+# Start polling
+bot.polling()
